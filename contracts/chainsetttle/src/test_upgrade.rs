@@ -105,6 +105,7 @@ fn make_shipment(
             proof_submitters: vec![env],
             require_dual_attestation: false,
             fund_from_vault: false,
+             collateral_slash_bps_per_miss: 0,
         },
     );
 }

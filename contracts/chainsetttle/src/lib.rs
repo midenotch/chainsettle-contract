@@ -467,6 +467,12 @@ pub struct ShipmentOptions {
     /// When true, `create_shipment` debits the primary buyer's vault balance
     /// instead of transferring tokens. Refunds return to the vault.
     pub fund_from_vault: bool,
+
+    // ── Collateral slashing on missed deadline ────────────────────────────────
+    /// Basis points of supplier collateral to slash to the buyer when a
+    /// milestone deadline is missed without proof submission (0 = disabled).
+    /// Each milestone can be slashed at most once.
+    pub collateral_slash_bps_per_miss: u32,
 }
 
 /// #545 – Pending dual-attestation proof awaiting the second party.
@@ -1550,6 +1556,34 @@ pub enum DataKeyExt4 {
     SubstituteProposal(String, u32),
     MilestoneSupplier(String, u32),
     ShipmentHadDispute(String),
+
+    // ── #575/#576/#577/#578 ───────────────────────────────────────────────
+    /// Admin-configured cap on the number of IDs `get_shipment_summaries`
+    /// accepts in one call (absent = `constants::DEFAULT_MAX_SUMMARY_BATCH`).
+    MaxSummaryBatch,
+    /// Cumulative post-fee amount paid to (supplier, token) across all shipments.
+    SupplierEarned(Address, Address),
+    /// Cumulative gross escrow released on behalf of (buyer, token).
+    BuyerSpent(Address, Address),
+    /// Bounded dispute history for an address, as buyer or supplier.
+    DisputeHistory(Address),
+    /// Admin-configured post-completion rating window in ledgers (0 = disabled).
+    RatingWindowLedgers,
+    /// Marker recording that (shipment_id, rater) has already rated.
+    ShipmentRated(String, Address),
+    /// Ledger at which a shipment became Completed (drives the rating window).
+    CompletedAtLedger(String),
+    /// Running (count, sum of stars) aggregate for a rated address.
+    RatingAgg(Address),
+
+    // ── Collateral slashing on missed deadline ────────────────────────────────
+    /// Basis points of the shipment's remaining supplier collateral to forfeit to
+    /// the buyer on each missed milestone deadline, as configured at creation
+    /// (absent/0 = slashing disabled).
+    CollateralSlashBpsPerMiss(String),
+    /// Records that (shipment_id, milestone_index) has already been slashed, so
+    /// the same milestone can never be charged twice.
+    CollateralSlashedForMiss(String, u32),
 }
 
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
@@ -3514,6 +3548,7 @@ impl ChainSettleContract {
             proof_submitters: Vec::new(env),
             require_dual_attestation: false,
             fund_from_vault: false,
+            collateral_slash_bps_per_miss: 0,
         }
     }
 
@@ -3789,6 +3824,154 @@ impl ChainSettleContract {
             ),
             (milestone_index, share, remaining - share),
         );
+    }
+
+    // ----------------------------------------------------------
+    // COLLATERAL SLASHING ON A MISSED MILESTONE DEADLINE
+    // ----------------------------------------------------------
+
+    /// Basis points of the shipment's remaining supplier collateral forfeited to
+    /// the buyer for each missed milestone deadline (`0` / absent = disabled).
+    pub fn get_collateral_slash_bps(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id))
+            .unwrap_or(0)
+    }
+
+    /// Whether (shipment_id, milestone_index) has already been slashed for a
+    /// missed deadline. Read-only; no authorization required.
+    pub fn is_collateral_slashed(env: Env, shipment_id: String, milestone_index: u32) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::CollateralSlashedForMiss(
+                shipment_id,
+                milestone_index,
+            ))
+            .unwrap_or(false)
+    }
+
+    /// Permissionless: forfeit a configured share of the supplier's remaining
+    /// collateral to the primary buyer because `milestone_index` passed its
+    /// deadline without proof being submitted. Returns the amount slashed.
+    ///
+    /// Eligibility, all enforced before any funds move:
+    ///  - the shipment is `Active` and not paused;
+    ///  - `collateral_slash_bps_per_miss > 0` (otherwise slashing is disabled);
+    ///  - the milestone still has a deadline and it is in the past;
+    ///  - the milestone is still `Pending` (no proof submitted);
+    ///  - this milestone has not been slashed before;
+    ///  - collateral remains locked and the computed slash is non-zero.
+    ///
+    /// The slash is `remaining_collateral * bps / 10_000`, capped at the
+    /// remaining collateral, and is debited from `SupplierCollateral` so later
+    /// slashes and the eventual return on completion/cancellation only ever see
+    /// what is still held.
+    pub fn slash_collateral_for_miss(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> i128 {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let bps = Self::get_collateral_slash_bps(env.clone(), shipment_id.clone());
+        if bps == 0 {
+            panic!("collateral slashing is not enabled");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        // Only a still-pending milestone counts as "missed": once proof is in
+        // (or the milestone is settled) the deadline no longer penalises anyone.
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone is not pending");
+        }
+
+        // Prefer the extension-adjusted deadline, mirroring the other
+        // deadline-aware paths (e.g. pause notice, upcoming deadlines).
+        let deadline: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::MilestoneDeadline(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or(milestone.deadline_ledger);
+        if deadline == 0 {
+            panic!("milestone has no deadline");
+        }
+        if env.ledger().sequence() <= deadline {
+            panic!("milestone deadline has not passed");
+        }
+
+        let slashed_key = DataKeyExt4::CollateralSlashedForMiss(
+            shipment_id.clone(),
+            milestone_index,
+        );
+        if env.storage().persistent().has(&slashed_key) {
+            panic!("milestone already slashed");
+        }
+
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let remaining: i128 = env.storage().persistent().get(&collateral_key).unwrap_or(0);
+        if remaining <= 0 {
+            panic!("no supplier collateral remaining");
+        }
+        let slash = ((remaining * bps as i128) / 10_000).min(remaining);
+        if slash <= 0 {
+            panic!("slash amount rounds to zero");
+        }
+
+        Self::refund_to_buyer(&env, &shipment_id, &shipment, slash);
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &(remaining - slash));
+        env.storage().persistent().extend_ttl(
+            &collateral_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.storage().persistent().set(&slashed_key, &true);
+        env.storage().persistent().extend_ttl(
+            &slashed_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "collateral_slashed"),
+            Symbol::new(&env, "slash_collateral"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_slashed"), shipment_id.clone()),
+            (
+                milestone_index,
+                slash,
+                remaining - slash,
+                shipment.buyers.get(0).unwrap(),
+                caller,
+            ),
+        );
+
+        slash
     }
 
     // ----------------------------------------------------------
@@ -4647,6 +4830,7 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt3::ConditionBreachReports(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::SubstituteProposal(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt4::MilestoneSupplier(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::CollateralSlashedForMiss(s.clone(), idx).into_val(env));
         if let Some(purpose) = env
             .storage()
             .persistent()
@@ -6257,6 +6441,17 @@ impl ChainSettleContract {
         let inspected_milestones = options.inspected_milestones.clone();
         let proof_submitters = options.proof_submitters.clone();
         let require_dual_attestation = options.require_dual_attestation;
+        // Collateral slashing on missed milestone deadlines.
+        let collateral_slash_bps_per_miss = options.collateral_slash_bps_per_miss;
+
+        if collateral_slash_bps_per_miss > 10_000 {
+            panic!("collateral_slash_bps_per_miss cannot exceed 10000 (100%)");
+        }
+        // Slashing is funded entirely by the supplier's collateral, so a
+        // non-zero rate on a shipment that locks none would be a no-op.
+        if collateral_slash_bps_per_miss > 0 && options.supplier_collateral <= 0 {
+            panic!("collateral_slash_bps_per_miss requires supplier_collateral > 0");
+        }
 
         if buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -6772,6 +6967,20 @@ impl ChainSettleContract {
             &proof_submitters,
             require_dual_attestation,
         );
+
+        // Persist the missed-deadline slashing rate (0 = disabled, so the key
+        // is only written when the feature is actually in use).
+        if collateral_slash_bps_per_miss > 0 {
+            let slash_key = DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id.clone());
+            env.storage()
+                .persistent()
+                .set(&slash_key, &collateral_slash_bps_per_miss);
+            env.storage().persistent().extend_ttl(
+                &slash_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
 
         // #164: Store per-milestone Unix timestamp deadlines when provided.
         if deadlines.len() > 0 {
@@ -19673,6 +19882,7 @@ mod test_standing_orders;
 mod test_allowance_funding;
 mod test_feat_issues;
 mod test_feat_earnings;
+mod test_slash_collateral;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;

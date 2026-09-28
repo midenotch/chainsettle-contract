@@ -170,6 +170,7 @@ fn exec(
                 proof_submitters: vec![env],
                 require_dual_attestation: false,
                 fund_from_vault: false,
+                 collateral_slash_bps_per_miss: 0,
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.create_shipment(

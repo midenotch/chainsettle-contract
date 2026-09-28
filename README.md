@@ -957,6 +957,10 @@ remaining)`.
   supplier at completion, or to the buyer (or treasury) on cancellation or
   expiry, as before.
 - **Turned off (the default)**, nothing changes.
+- **Missing a deadline costs the supplier.** See
+  [Collateral Slashing on a Missed Milestone Deadline](#collateral-slashing-on-a-missed-milestone-deadline)
+  for forfeiting a configured share of the remaining collateral to the buyer.
+
 Emergency pause (circuit breaker)
 Admin-only kill switch that halts state-changing calls across every
 shipment without touching any stored data. Locked funds stay in escrow
@@ -2514,4 +2518,64 @@ Function | Who | Behaviour
 `set_rating_window_ledgers(admin, window)` / `get_rating_window_ledgers()` | Admin / anyone | Ledgers after completion during which ratings are accepted.
 `rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
 `get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
+
+### Collateral Slashing on a Missed Milestone Deadline
+
+Supplier collateral normally only protects against abandonment — it all goes to
+the supplier on completion, or to the buyer on cancellation. A shipment can
+also give it teeth for timeliness: when a milestone's deadline passes with no
+proof submitted, a configured share of the supplier's *remaining* collateral is
+forfeited to the buyer.
+
+Set the rate at creation with `ShipmentOptions.collateral_slash_bps_per_miss`
+(basis points). `0` is the default and leaves behaviour completely unchanged.
+Because the slash is funded entirely by the collateral, a non-zero rate
+requires `ShipmentOptions.supplier_collateral > 0`, and a rate above `10_000`
+is rejected.
+
+| Option | Type | Validation / default |
+| --- | --- | --- |
+| `collateral_slash_bps_per_miss` | `u32` | `0` = disabled. `≤ 10000`, and non-zero requires `supplier_collateral > 0` |
+
+Function | Who | Behaviour
+--- | --- | ---
+`slash_collateral_for_miss(caller, shipment_id, milestone_index) → i128` | Anyone (permissionless, `require_auth` on `caller`) | Forfeits `remaining_collateral × bps / 10_000` to the primary buyer, debits `SupplierCollateral`, marks the milestone, emits `collateral_slashed` with `(milestone_index, slashed, remaining, buyer, caller)`, writes a `collateral_slashed` audit entry, and returns the amount slashed.
+`get_collateral_slash_bps(shipment_id) → u32` | Anyone (read-only) | Configured rate, `0` when unset.
+`is_collateral_slashed(shipment_id, milestone_index) → bool` | Anyone (read-only) | Whether that milestone was already charged.
+
+A call succeeds only when **all** of the following hold:
+
+- The shipment is `Active` and not individually paused.
+- The rate is non-zero (`collateral slashing is not enabled`).
+- The milestone is still `Pending` (`milestone is not pending`) — once proof is
+  in, the deadline no longer penalises anyone, however late it arrived.
+- The milestone has a deadline (`milestone has no deadline`) and the current
+  ledger is strictly **past** it (`milestone deadline has not passed` on the
+  deadline ledger itself). The deadline read is the extension-adjusted one when
+  a `request_extension`/`approve_extension` cycle has run, so an approved
+  extension always buys the supplier more time.
+- The milestone has not been slashed before (`milestone already slashed`).
+- Collateral is still held (`no supplier collateral remaining`) and the
+  computed amount is at least one base unit (`slash amount rounds to zero`).
+
+Other behaviour worth knowing:
+
+- **At most one slash per milestone.** The flag is written to persistent
+  storage, so repeated calls are rejected rather than silently draining the
+  supplier. It is registered in `per_milestone_keys`, so it moves with its
+  milestone when adjacent milestones are merged.
+- **Never more than what is held.** The amount is capped at the remaining
+  collateral and debited immediately, so a second milestone missing its
+  deadline slashes only what is left, and a later completion or cancellation
+  returns only the un-slashed remainder to the supplier.
+- **Buyer vault shipments work too.** A vault-funded shipment credits the slash
+  back into the buyer's vault rather than their wallet, matching how refunds
+  already behave.
+- **The forfeiture is auditable.** `collateral_slashed` is emitted and a
+  `collateral_slashed` entry is written to the shipment audit log, alongside the
+  `milestone_index`, the amount, and who triggered it.
+
+Storage lives under `DataKeyExt4` (`DataKeyExt3` was at its 50-variant limit).
+
+
 
