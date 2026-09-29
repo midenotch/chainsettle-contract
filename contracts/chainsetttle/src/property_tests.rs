@@ -346,7 +346,8 @@ mod contract_prop_tests {
                 proof_submitters: vec![env],
                 require_dual_attestation: false,
                 fund_from_vault: false,
-                 collateral_slash_bps_per_miss: 0,
+                milestone_suppliers: vec![env],
+                refund_recipient: None,
             },
         );
     }
@@ -665,7 +666,8 @@ mod milestone_percent_fuzz {
                 proof_submitters: vec![env],
                 require_dual_attestation: false,
                 fund_from_vault: false,
-                 collateral_slash_bps_per_miss: 0,
+                milestone_suppliers: vec![env],
+                refund_recipient: None,
             }
         }
 

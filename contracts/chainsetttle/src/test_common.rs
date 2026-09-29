@@ -144,7 +144,8 @@ pub fn default_options(_env: &Env) -> ShipmentOptions {
         proof_submitters: vec![_env],
         require_dual_attestation: false,
         fund_from_vault: false,
-        collateral_slash_bps_per_miss: 0,
+        milestone_suppliers: vec![_env],
+        refund_recipient: None,
     }
 }
 
